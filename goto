@@ -1,0 +1,298 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use MIME::Base64;
+use Term::ReadKey;
+use Socket; # 用于主机名解析
+use Cwd; # 用于获取当前目录
+
+##############################################################
+## 作者: lqc (由 Grok 优化)
+## 用途: 简化 SSH 和文件传输（上传/下载）连接，保存配置
+## 许可证: GNU 通用公共许可证 3
+## 详情: http://www.gnu.org/licenses/gpl.txt
+##############################################################
+
+# 默认配置文件路径
+my $conf_file = $ENV{"HOME"} . '/goto.ini';
+my $config = {};
+
+# 默认值
+my ($user, $port, $othermode, $local_path, $remote_path);
+my $default_port = 22;
+my $default_user = 'root';
+
+# 解析命令行参数
+if (@ARGV == 0 || $ARGV[0] eq '-h') {
+    printHelp();
+    exit 0;
+}
+
+my $host;
+$othermode = shift @ARGV if $ARGV[0] =~ /^(up|down|ping)$/;
+$host = shift @ARGV // '';
+if ($othermode) {
+    if ($othermode eq 'up') {
+        $local_path = shift @ARGV;  # up: 本地路径在前
+        $remote_path = shift @ARGV;
+    } elsif ($othermode eq 'down') {
+        $remote_path = shift @ARGV; # down: 远程路径在前
+        $local_path = shift @ARGV;
+    }
+}
+
+if (!$host) {
+    print "请输入 IP/主机名: ";
+    $host = <STDIN>;
+    chomp($host);
+    die "必须提供主机。\n" unless $host;
+}
+
+# 加载或创建配置文件
+unless (-f $conf_file) {
+    print "\n未找到配置文件，正在创建新配置...\n";
+    print "默认用户名 [$default_user]: ";
+    $user = <STDIN>;
+    chomp($user);
+    $user = $default_user if $user eq '';
+
+    print "链接文件路径: ";
+    my $links = <STDIN>;
+    chomp($links);
+    die "必须提供链接文件路径。\n" unless $links;
+
+    $config->{'global'} = {
+        private_links => $links,
+        user          => $user,
+        port          => $default_port
+    };
+    iniWrite($conf_file, $config) or die "无法写入 $conf_file: $!\n";
+    chmod 0600, $conf_file;
+}
+
+$config = iniRead($conf_file) or die "无法读取 $conf_file: $!\n";
+my $my_links = $config->{'global'}->{'private_links'} or die "配置文件中未定义链接文件。\n";
+$user ||= $config->{'global'}->{'user'} || $default_user;
+$port ||= $config->{'global'}->{'port'} || $default_port;
+
+# 检查必要命令
+my $sshpass_available = `which sshpass 2>/dev/null` ? 1 : 0;
+my $scp_available = `which scp 2>/dev/null` ? 1 : 0;
+my $ssh_available = `which ssh 2>/dev/null` ? 1 : 0;
+my $ping_available = `which ping 2>/dev/null` ? 1 : 0;
+
+# 处理连接
+my ($connecthost, $password);
+my $values = ReadFile($my_links);
+if (IsIP($host)) {
+    $connecthost = $host;
+} elsif ($values->{$host}) {
+    $connecthost = $values->{$host}->{'ip'};
+    $port = $values->{$host}->{'port'};
+    $user = $values->{$host}->{'user'};
+    $password = $values->{$host}->{'password'};
+} elsif (LookupHostname($host)) {
+    $connecthost = $host;
+} else {
+    print "\n未知别名或主机名，是否添加到链接文件 (y/n)? ";
+    my $answer = <STDIN>;
+    chomp($answer);
+    if (lc($answer) eq 'y') {
+        print "IP: ";
+        my $ip = <STDIN>;
+        chomp($ip);
+        # die "无效的 IP 地址。\n" unless IsIP($ip);
+
+        print "端口 [$port]: ";
+        my $new_port = <STDIN>;
+        chomp($new_port);
+        $new_port = $port if $new_port eq '';
+        die "端口必须是数字。\n" unless IsNumeric($new_port);
+
+        print "用户 [$user]: ";
+        my $new_user = <STDIN>;
+        chomp($new_user);
+        $new_user = $user if $new_user eq '';
+
+        print "密码（留空使用密钥认证）: ";
+        ReadMode('noecho');
+        $password = ReadLine(0);
+        ReadMode('restore');
+        print "\n";
+        chomp($password);
+
+        WriteFile($host, $ip, $new_port, $new_user, $password);
+        $connecthost = $ip;
+        $port = $new_port;
+        $user = $new_user;
+    } else {
+        exit 1;
+    }
+}
+
+# 执行命令
+$othermode = lc($othermode || 'ssh');
+print "\n正在连接 $connecthost:$port，用户名 $user（模式: $othermode）\n\n";
+
+if ($othermode eq 'up') {
+    die "未指定本地路径。\n" unless $local_path;
+    die "未指定远程路径。\n" unless $remote_path;
+    die "本地路径 $local_path 不存在。\n" unless -e $local_path;
+    die "未找到 scp 命令。\n" unless $scp_available;
+    my $recursive = (-d $local_path) ? "-r" : "";
+    if ($password && $sshpass_available) {
+        system("sshpass -p '$password' scp $recursive -o StrictHostKeyChecking=no \"$local_path\" $user\@$connecthost:\"$remote_path\" 2>&1");
+    } else {
+        system("scp $recursive -o StrictHostKeyChecking=no \"$local_path\" $user\@$connecthost:\"$remote_path\" 2>&1");
+    }
+} elsif ($othermode eq 'down') {
+    die "未指定本地路径。\n" unless $local_path;
+    die "未指定远程路径。\n" unless $remote_path;
+    die "未找到 scp 命令。\n" unless $scp_available;
+    # 验证远程路径存在
+    if ($ssh_available && ($password && $sshpass_available)) {
+        my $check_cmd = "sshpass -p '$password' ssh -o StrictHostKeyChecking=no $user\@$connecthost -p $port '[ -e \"$remote_path\" ] || exit 1'";
+        system($check_cmd) == 0 or die "远程路径 $remote_path 不存在或不可访问。\n";
+    }
+    # 规范化本地路径：将 ./ 或 . 转换为当前目录，扩展 ~
+    my $target_path = $local_path;
+    $target_path = getcwd() if $local_path eq './' || $local_path eq '.';
+    $target_path =~ s|^~|$ENV{'HOME'}|; # 扩展 ~
+    # 确保本地目标目录存在
+    my $target_dir = $target_path;
+    $target_dir =~ s/[^\/]*$//; # 移除文件名部分（如果有）
+    $target_dir = getcwd() if $target_dir eq '';
+    mkdir $target_dir unless -d $target_dir;
+    die "无法创建本地目标目录 $target_dir: $!\n" unless -d $target_dir;
+    # 始终使用 -r，因为远程路径可能是目录
+    my $recursive = "-r";
+    if ($password && $sshpass_available) {
+        system("sshpass -p '$password' scp $recursive -o StrictHostKeyChecking=no $user\@$connecthost:\"$remote_path\" \"$target_path\" 2>&1");
+    } else {
+        system("scp $recursive -o StrictHostKeyChecking=no $user\@$connecthost:\"$remote_path\" \"$target_path\" 2>&1");
+    }
+} elsif ($othermode eq 'ping') {
+    die "未找到 ping 命令。\n" unless $ping_available;
+    system("ping -c 4 $connecthost");
+} else { # 默认 ssh
+    die "未找到 ssh 命令。\n" unless $ssh_available;
+    if ($password && $sshpass_available) {
+        system("sshpass -p '$password' ssh -o StrictHostKeyChecking=no $user\@$connecthost -p $port");
+    } else {
+        system("ssh -o StrictHostKeyChecking=no $user\@$connecthost -p $port");
+    }
+}
+
+exit 0;
+
+# 检查是否为有效 IPv4 地址
+sub IsIP {
+    my $value = shift;
+    return 0 unless defined $value;
+    my @octets = $value =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    return 0 unless @octets == 4;
+    return 0 if grep { $_ < 0 || $_ > 255 } @octets;
+    return 1;
+}
+
+# 检查是否为数字
+sub IsNumeric {
+    my $value = shift;
+    return $value =~ /^\d+$/ ? 1 : 0;
+}
+
+# 解析主机名
+sub LookupHostname {
+    my $value = shift;
+    my $ip = gethostbyname($value);
+    return defined $ip ? 1 : 0;
+}
+
+# 读取链接文件
+sub ReadFile {
+    my $file = shift;
+    open(my $fh, "<", $file) or die "无法读取 $file: $!\n";
+    my %rethash;
+    while (my $line = <$fh>) {
+        chomp($line);
+        if ($line =~ /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(\S*)\s*$/) {
+            $rethash{$1} = {
+                ip       => $2,
+                port     => $3,
+                user     => $4,
+                password => $5 ? MIME::Base64::decode_base64($5) : ''
+            };
+        }
+    }
+    close($fh);
+    return \%rethash;
+}
+
+# 写入链接文件
+sub WriteFile {
+    my ($alias, $ip, $port, $user, $password) = @_;
+    $password = MIME::Base64::encode_base64($password, "") if $password;
+    open(my $fp, ">>", $my_links) or die "无法打开 $my_links: $!\n";
+    print $fp "$alias $ip $port $user $password\n";
+    close($fp);
+    chmod 0600, $my_links;
+}
+
+# 读取 INI 文件
+sub iniRead {
+    my $ini = shift;
+    open(my $fh, "<", $ini) or return undef;
+    my ($section, %conf);
+    while (my $line = <$fh>) {
+        chomp($line);
+        next if $line =~ /^\s*$/;
+        if ($line =~ /^\s*\[\s*(.+?)\s*\]\s*$/) {
+            $section = $1;
+        } elsif ($line =~ /^\s*([^=]+?)\s*=\s*(.*?)\s*$/) {
+            $conf{$section}->{$1} = $2;
+        }
+    }
+    close($fh);
+    return \%conf;
+}
+
+# 写入 INI 文件
+sub iniWrite {
+    my ($ini, $conf) = @_;
+    open(my $fh, ">", $ini) or return 0;
+    foreach my $section (sort { ($b eq '_') <=> ($a eq '_') || ($a cmp $b) } keys %$conf) {
+        my $block = $conf->{$section};
+        print $fh "\n" if tell($fh) > 0;
+        print $fh "[$section]\n" unless $section eq '_';
+        foreach my $property (sort keys %$block) {
+            print $fh "$property=$block->{$property}\n";
+        }
+    }
+    close($fh);
+    return 1;
+}
+
+# 帮助信息
+sub printHelp {
+    print <<EOF;
+用法: goto [模式] <IP/主机名> [路径1] [路径2]
+
+通过保存配置简化 SSH 和文件传输（上传/下载）连接。
+
+命令:
+  goto <IP/主机名>              建立 SSH 连接
+  goto up <IP/主机名> <本地路径> <远程路径>  上传文件/目录到远程服务器
+  goto down <IP/主机名> <远程路径> <本地路径>  从远程服务器下载文件/目录
+  goto ping <IP/主机名>         测试主机连通性
+  goto -h                       显示此帮助
+
+示例:
+  goto machi
+  goto up machi /local/file.txt /remote/
+  goto down machi /remote/logs ~/Downloads
+  goto ping 192.168.1.1
+
+配置文件: $conf_file
+链接文件: $my_links
+EOF
+}

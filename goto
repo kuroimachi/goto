@@ -11,14 +11,13 @@ use File::Path qw(make_path);
 use Getopt::Long;
 
 ##############################################################
-## goto - 单文件同步终极版（完全无警告、无语法错误）
-## 专为 luqiucheng 多Mac + iCloud 同步打造
+## goto - 单文件同步终极版 + 支持可选代理（专为 luqiucheng）
+## 配置目录：~/Documents/config/goto/goto.ini（iCloud 同步）
 ##############################################################
 
 my $BASE_DIR = "$ENV{HOME}/Documents/config/goto";
 my $INI_FILE = "$BASE_DIR/goto.ini";
 
-# 自动创建配置目录
 unless (-d $BASE_DIR) {
     make_path($BASE_DIR) or die "无法创建目录 $BASE_DIR: $!\n";
     say "创建配置目录：$BASE_DIR";
@@ -30,6 +29,9 @@ load_config();
 my $mode      = 'ssh';
 my $recursive = 0;
 my $quiet     = 0;
+my $proxy     = 0;        # 新增：是否启用代理
+my $proxy_host = '127.0.0.1';
+my $proxy_port = 7890;    # 默认 Clash 等代理的 SOCKS5 端口，可自行修改
 
 GetOptions(
     "up"          => sub { $mode = 'up' },
@@ -39,6 +41,7 @@ GetOptions(
     "edit"        => sub { $mode = 'edit' },
     "r|recursive" => \$recursive,
     "q|quiet"     => \$quiet,
+    "x|proxy"     => \$proxy,                  # 新增参数：-x 或 --proxy 启用代理
     "h|help"      => sub { print_help(); exit 0 },
 ) or exit 1;
 
@@ -50,16 +53,15 @@ if (!$target && $mode !~ /^(list|edit)$/) {
 my $default_user = $config->{global}{user} // 'root';
 my $default_port = $config->{global}{port} // 22;
 
-# 特殊模式直接退出
 if ($mode eq 'list') { list_hosts(); exit 0; }
 if ($mode eq 'edit') { exec($ENV{EDITOR} // 'nano', $INI_FILE); exit 0; }
 
 my ($ip, $port, $user, $pass) = resolve_target($target);
 
-say "→ $user\@$ip:$port  (模式: $mode)" unless $quiet;
+say "→ $user\@$ip:$port (模式: $mode" . ($proxy ? ", 走代理" : "") . ")" unless $quiet;
 
 if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass); }
-elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }
+elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }  # ping 不支持代理，保持原样
 elsif ($mode eq 'up')   { scp_transfer('up',   $ip, $port, $user, $pass, @ARGV); }
 elsif ($mode eq 'down') { scp_transfer('down', $ip, $port, $user, $pass, @ARGV); }
 else { die "未知模式: $mode\n"; }
@@ -154,9 +156,15 @@ sub save_config {
 sub ssh_connect {
     my ($ip, $port, $user, $pass) = @_;
     my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', '-p', $port, "$user\@$ip");
+
+    if ($proxy) {
+        push @cmd, '-o', "ProxyCommand=nc -x $proxy_host:$proxy_port %h %p";
+    }
+
     if ($pass && system("which sshpass >/dev/null 2>&1") == 0) {
         unshift @cmd, 'sshpass', '-p', $pass;
     }
+
     exec(@cmd);
 }
 
@@ -166,6 +174,10 @@ sub scp_transfer {
 
     my @opts = ('scp', '-P', $port, '-o', 'StrictHostKeyChecking=no');
     push @opts, '-r' if $recursive;
+
+    if ($proxy) {
+        push @opts, '-o', "ProxyCommand=nc -x $proxy_host:$proxy_port %h %p";
+    }
 
     my ($src, $dst);
     if ($dir eq 'up') {
@@ -188,15 +200,16 @@ sub scp_transfer {
     system(@opts, $src, $dst) == 0 or exit 1;
 }
 
+# 其余函数（list_hosts, is_ip, print_help）保持不变
 sub list_hosts {
     say "已保存的别名：";
     for my $name (sort grep { $_ ne 'global' } keys %$config) {
         my $h = $config->{$name};
         printf "  %-12s  %-15s  %-6s  %s\n",
             $name,
-            $h->{ip}       // '-',
-            $h->{port}     // '22',
-            $h->{user}     // '-';
+            $h->{ip} // '-',
+            $h->{port} // '22',
+            $h->{user} // '-';
     }
 }
 
@@ -208,20 +221,20 @@ sub is_ip {
 
 sub print_help {
     print <<'EOF';
-goto - 单文件同步终极版（已适配最新 Perl）
+goto - 单文件同步版 + 支持可选代理
 
 用法：
-  goto <别名|IP>
-  goto up   <别名|IP> <本地路径> <远程路径>
-  goto down <别名|IP> <远程路径> <本地路径>
-  goto ping <别名|IP>
-  goto --list          列出所有别名
-  goto --edit          编辑配置文件（iCloud 自动同步）
+  goto <别名|IP>                    → 直接 SSH
+  goto -x <别名|IP>                 → 通过代理 SSH（SOCKS5 127.0.0.1:7890）
+  goto up/down [-x] <别名|IP> <路径1> <路径2> → 上传/下载（-x 表示走代理）
+  goto ping <别名|IP>               → Ping（不支持代理）
+  goto --list                       → 列出所有别名
+  goto --edit                       → 编辑配置（iCloud 同步）
 
-配置文件唯一：
-  ~/Documents/config/goto/goto.ini
+新增参数：
+  -x 或 --proxy    → 启用 SOCKS5 代理（nc -x 127.0.0.1:7890）
 
-多台 Mac 共享同一份配置，开箱即用！
+配置文件：~/Documents/config/goto/goto.ini
 EOF
     exit 0;
 }

@@ -299,7 +299,12 @@ sub build_proxy_command {
 
 sub ssh_connect {
     my ($ip, $port, $user, $pass) = @_;
-    my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', '-p', $port, "$user\@$ip");
+    my @cmd = ('ssh', 
+               '-o', 'StrictHostKeyChecking=no', 
+               '-o', 'ServerAliveInterval=60',      # 每 60 秒发送一次 keepalive
+               '-o', 'ServerAliveCountMax=3',      # 最多 3 次无响应后断开（共 180 秒）
+               '-p', $port, 
+               "$user\@$ip");
 
     if ($proxy) {
         push @cmd, '-o', build_proxy_command($proxy_host, $proxy_port);

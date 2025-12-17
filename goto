@@ -29,9 +29,9 @@ load_config();
 my $mode      = 'ssh';
 my $recursive = 0;
 my $quiet     = 0;
-my $proxy     = 0;        # 新增：是否启用代理
+my $proxy     = 0;
 my $proxy_host = '127.0.0.1';
-my $proxy_port = 7890;    # 默认 Clash 等代理的 SOCKS5 端口，可自行修改
+my $proxy_port = 7890;  # Clash/V2Ray 等默认 SOCKS5 端口，可自行修改
 
 GetOptions(
     "up"          => sub { $mode = 'up' },
@@ -41,7 +41,7 @@ GetOptions(
     "edit"        => sub { $mode = 'edit' },
     "r|recursive" => \$recursive,
     "q|quiet"     => \$quiet,
-    "x|proxy"     => \$proxy,                  # 新增参数：-x 或 --proxy 启用代理
+    "x|proxy"     => \$proxy,
     "h|help"      => sub { print_help(); exit 0 },
 ) or exit 1;
 
@@ -61,7 +61,7 @@ my ($ip, $port, $user, $pass) = resolve_target($target);
 say "→ $user\@$ip:$port (模式: $mode" . ($proxy ? ", 走代理" : "") . ")" unless $quiet;
 
 if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass); }
-elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }  # ping 不支持代理，保持原样
+elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }
 elsif ($mode eq 'up')   { scp_transfer('up',   $ip, $port, $user, $pass, @ARGV); }
 elsif ($mode eq 'down') { scp_transfer('down', $ip, $port, $user, $pass, @ARGV); }
 else { die "未知模式: $mode\n"; }
@@ -200,7 +200,6 @@ sub scp_transfer {
     system(@opts, $src, $dst) == 0 or exit 1;
 }
 
-# 其余函数（list_hosts, is_ip, print_help）保持不变
 sub list_hosts {
     say "已保存的别名：";
     for my $name (sort grep { $_ ne 'global' } keys %$config) {
@@ -219,22 +218,42 @@ sub is_ip {
     return eval { inet_aton($i); 1 };
 }
 
+# ============== 最新最详细的帮助信息 ==============
 sub print_help {
     print <<'EOF';
-goto - 单文件同步版 + 支持可选代理
+goto - 单文件同步 + 可选代理（终极版）
 
-用法：
-  goto <别名|IP>                    → 直接 SSH
-  goto -x <别名|IP>                 → 通过代理 SSH（SOCKS5 127.0.0.1:7890）
-  goto up/down [-x] <别名|IP> <路径1> <路径2> → 上传/下载（-x 表示走代理）
-  goto ping <别名|IP>               → Ping（不支持代理）
-  goto --list                       → 列出所有别名
-  goto --edit                       → 编辑配置（iCloud 同步）
+基本用法：
+  goto <别名|IP>                  → 直接 SSH 登录服务器
+  goto -x <别名|IP>               → 通过 SOCKS5 代理登录（127.0.0.1:7890）
 
-新增参数：
-  -x 或 --proxy    → 启用 SOCKS5 代理（nc -x 127.0.0.1:7890）
+文件传输（支持组合使用 -x -r）：
+  goto up   [-x] [-r] <别名|IP> <本地路径> <远程路径>
+      → 上传：本地 → 服务器
+      示例：
+        goto up prod ./error.log /var/log/
+        goto up -x -r hkserver /project/build/ /www/
 
-配置文件：~/Documents/config/goto/goto.ini
+  goto down [-x] [-r] <别名|IP> <远程路径> <本地路径>
+      → 下载：服务器 → 本地
+      示例：
+        goto down prod /etc/nginx/nginx.conf ~/Downloads/
+        goto down -x -r overseas /data/backup.tar.gz ./
+
+其他命令：
+  goto ping <别名|IP>             → Ping 测试连通性（不支持代理）
+  goto --list                     → 列出所有已保存的别名
+  goto --edit                     → 用编辑器打开配置文件（iCloud 自动同步）
+
+可选参数（可乱序）：
+  -x 或 --proxy      → 启用 SOCKS5 代理（nc -x 127.0.0.1:7890）
+  -r 或 --recursive  → 递归传输目录
+  -q 或 --quiet      → 安静模式（减少提示）
+
+配置文件（唯一文件，多台 Mac 共享）：
+  ~/Documents/config/goto/goto.ini
+
+完美支持 iCloud 同步，别名、密码、默认设置全部跨设备实时可用！
 EOF
     exit 0;
 }

@@ -2,7 +2,6 @@
 use strict;
 use warnings;
 use v5.10;
-use MIME::Base64;
 use Term::ReadKey;
 use Socket;
 use Cwd qw(getcwd);
@@ -25,6 +24,8 @@ unless (-d $BASE_DIR) {
 
 my $config = { global => { user => 'root', port => 22 } };
 load_config();
+# 迁移现有密码到 Keychain
+migrate_passwords_to_keychain();
 
 my $mode      = 'ssh';
 my $recursive = 0;
@@ -37,8 +38,10 @@ GetOptions(
     "up"          => sub { $mode = 'up' },
     "down"        => sub { $mode = 'down' },
     "ping"        => sub { $mode = 'ping' },
+    "test"        => sub { $mode = 'test' },
     "list"        => sub { $mode = 'list' },
     "edit"        => sub { $mode = 'edit' },
+    "delete"      => sub { $mode = 'delete' },
     "r|recursive" => \$recursive,
     "q|quiet"     => \$quiet,
     "x|proxy"     => \$proxy,
@@ -46,30 +49,114 @@ GetOptions(
 ) or exit 1;
 
 my $target = shift @ARGV // '';
-if (!$target && $mode !~ /^(list|edit)$/) {
+if (!$target && $mode !~ /^(list|edit|delete)$/) {
     print_help();
 }
 
 my $default_user = $config->{global}{user} // 'root';
 my $default_port = $config->{global}{port} // 22;
 
+# 从配置文件读取代理设置（如果存在）
+if (exists $config->{global}{proxy_host}) {
+    $proxy_host = $config->{global}{proxy_host};
+}
+if (exists $config->{global}{proxy_port}) {
+    $proxy_port = $config->{global}{proxy_port};
+}
+
 if ($mode eq 'list') { list_hosts(); exit 0; }
 if ($mode eq 'edit') { exec($ENV{EDITOR} // 'nano', $INI_FILE); exit 0; }
+if ($mode eq 'delete') {
+    my $alias = shift @ARGV;
+    die "请指定要删除的别名\n" unless $alias;
+    delete_alias($alias);
+    exit 0;
+}
 
-my ($ip, $port, $user, $pass) = resolve_target($target);
+my ($ip, $port, $user, $pass) = resolve_target($target, $default_user, $default_port);
 
 say "→ $user\@$ip:$port (模式: $mode" . ($proxy ? ", 走代理" : "") . ")" unless $quiet;
 
 if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass); }
 elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }
+elsif ($mode eq 'test') { test_connection($ip, $port, $user, $pass); }
 elsif ($mode eq 'up')   { scp_transfer('up',   $ip, $port, $user, $pass, @ARGV); }
 elsif ($mode eq 'down') { scp_transfer('down', $ip, $port, $user, $pass, @ARGV); }
 else { die "未知模式: $mode\n"; }
 
 # ==================== 子函数 ====================
 
+# macOS Keychain 密码管理函数
+sub keychain_get_password {
+    my $alias = shift;
+    my $service = "goto";
+    my $account = $alias;
+    
+    my $password = `security find-generic-password -a "$account" -s "$service" -w 2>/dev/null`;
+    chomp $password;
+    return $password if $? == 0 && $password ne '';
+    return undef;
+}
+
+sub keychain_set_password {
+    my ($alias, $password) = @_;
+    my $service = "goto";
+    my $account = $alias;
+    
+    # 先删除旧密码（如果存在）
+    system("security delete-generic-password -a \"$account\" -s \"$service\" >/dev/null 2>&1");
+    
+    # 添加新密码
+    open my $pipe, '|-', "security add-generic-password -a \"$account\" -s \"$service\" -w \"$password\" -U" or return 0;
+    close $pipe;
+    return $? == 0;
+}
+
+sub keychain_delete_password {
+    my $alias = shift;
+    my $service = "goto";
+    my $account = $alias;
+    
+    system("security delete-generic-password -a \"$account\" -s \"$service\" >/dev/null 2>&1");
+    return $? == 0;
+}
+
+# 迁移现有 Base64 密码到 Keychain
+sub migrate_passwords_to_keychain {
+    # 动态加载 MIME::Base64（仅在迁移时需要）
+    eval { require MIME::Base64; MIME::Base64->import('decode_base64'); };
+    return if $@;  # 如果无法加载模块，跳过迁移
+    
+    my $migrated = 0;
+    
+    for my $alias (keys %$config) {
+        next if $alias eq 'global';
+        next unless exists $config->{$alias}{password};
+        
+        # 检查 Keychain 中是否已有密码
+        next if keychain_get_password($alias);
+        
+        # 从配置文件读取 Base64 密码并迁移
+        my $base64_pass = $config->{$alias}{password};
+        my $password = decode_base64($base64_pass);
+        
+        if (keychain_set_password($alias, $password)) {
+            # 从配置文件中删除 password 字段
+            delete $config->{$alias}{password};
+            $migrated++;
+        }
+    }
+    
+    if ($migrated > 0) {
+        my $default_user = $config->{global}{user} // 'root';
+        my $default_port = $config->{global}{port} // 22;
+        save_config($default_user, $default_port);
+        say "已迁移 $migrated 个密码到 macOS Keychain（更安全）" unless $quiet;
+    }
+}
+
 sub resolve_target {
-    my $input = shift;
+    my ($input, $default_user, $default_port) = @_;
     my ($ip, $port, $user, $pass) = ($input, $default_port, $default_user, '');
 
     if (exists $config->{$input}) {
@@ -77,45 +164,83 @@ sub resolve_target {
         $ip   = $h->{ip}       // $ip;
         $port = $h->{port}     // $port;
         $user = $h->{user}     // $user;
-        $pass = $h->{password} ? decode_base64($h->{password}) : '';
+        # 从 Keychain 读取密码
+        $pass = keychain_get_password($input) // '';
         say "使用别名 [$input]" unless $quiet;
     }
     elsif (!is_ip($input)) {
         if (my $packed = gethostbyname($input)) {
             $ip = inet_ntoa($packed);
             say "DNS 解析 $input → $ip" unless $quiet;
+        } else {
+            warn "警告: 无法解析域名 $input\n" unless $quiet;
         }
     }
 
     if (!is_ip($ip) && !exists $config->{$input}) {
-        add_alias($input);
-        return resolve_target($input);
+        add_alias($input, $default_user, $default_port);
+        return resolve_target($input, $default_user, $default_port);
     }
+    
+    # 验证解析结果
+    die "错误: 无法解析目标 $input（不是有效的 IP、域名或别名）\n" unless is_ip($ip) || exists $config->{$input};
+    
     return ($ip, $port, $user, $pass);
 }
 
 sub add_alias {
-    my $alias = shift;
+    my ($alias, $default_user, $default_port) = @_;
+    
+    # 检查别名是否已存在
+    if (exists $config->{$alias}) {
+        print "别名 [$alias] 已存在，是否覆盖？(y/N): ";
+        chomp(my $confirm = <STDIN>);
+        die "已取消\n" unless lc($confirm) eq 'y';
+    }
+    
     say "添加新别名 [$alias]";
-    print "IP: "; chomp(my $ip = <STDIN>);
-    die "无效 IP\n" unless is_ip($ip) || gethostbyname($ip);
+    print "IP 或域名: "; chomp(my $ip = <STDIN>);
+    die "无效 IP 或域名\n" unless is_ip($ip) || gethostbyname($ip);
 
     print "端口 [$default_port]: "; chomp(my $p = <STDIN>); $p = $default_port if $p eq '';
     print "用户 [$default_user]: "; chomp(my $u = <STDIN>); $u = $default_user if $u eq '';
 
+    my $pass = '';
     print "密码（留空用密钥）: ";
     ReadMode('noecho');
-    chomp(my $pass = <STDIN>);
+    chomp($pass = <STDIN>);
     ReadMode('restore');
     print "\n";
+    
+    # 如果输入了密码，要求二次确认
+    if ($pass ne '') {
+        print "再次输入密码确认: ";
+        ReadMode('noecho');
+        chomp(my $pass2 = <STDIN>);
+        ReadMode('restore');
+        print "\n";
+        die "密码不一致，已取消\n" unless $pass eq $pass2;
+    }
 
     $config->{$alias} = {
         ip   => $ip,
         port => $p,
         user => $u,
-        ($pass ne '' ? (password => encode_base64($pass, '')) : ()),
     };
-    save_config();
+    
+    # 将密码存储到 Keychain（如果提供了密码）
+    if ($pass ne '') {
+        if (keychain_set_password($alias, $pass)) {
+            say "密码已安全存储到 macOS Keychain" unless $quiet;
+        } else {
+            warn "警告: 无法将密码存储到 Keychain，请检查系统权限\n";
+        }
+    } else {
+        # 如果没有密码，确保 Keychain 中也没有旧密码
+        keychain_delete_password($alias);
+    }
+    
+    save_config($default_user, $default_port);
     say "已保存别名 [$alias]（iCloud 同步后其他机器立即可用）";
 }
 
@@ -137,14 +262,24 @@ sub load_config {
 }
 
 sub save_config {
+    my ($default_user, $default_port) = @_;
     open my $fh, '>', $INI_FILE or die "无法写入 $INI_FILE: $!\n";
     print $fh "[global]\n";
     print $fh "user=$default_user\n";
-    print $fh "port=$default_port\n\n";
+    print $fh "port=$default_port\n";
+    # 保存代理设置（如果已修改）
+    if (exists $config->{global}{proxy_host}) {
+        print $fh "proxy_host=$config->{global}{proxy_host}\n";
+    }
+    if (exists $config->{global}{proxy_port}) {
+        print $fh "proxy_port=$config->{global}{proxy_port}\n";
+    }
+    print $fh "\n";
 
     for my $sec (sort grep { $_ ne 'global' } keys %$config) {
         print $fh "[$sec]\n";
-        for my $k (qw(ip port user password)) {
+        # 不再保存 password 字段，密码存储在 Keychain 中
+        for my $k (qw(ip port user)) {
             print $fh "$k=$config->{$sec}{$k}\n" if exists $config->{$sec}{$k};
         }
         print $fh "\n";
@@ -153,15 +288,27 @@ sub save_config {
     chmod 0600, $INI_FILE;
 }
 
+sub build_proxy_command {
+    my ($proxy_host, $proxy_port) = @_;
+    # 检查 nc 命令是否存在
+    unless (`which nc 2>/dev/null`) {
+        die "错误: 未找到 'nc' 命令，无法使用代理。请安装 netcat。\n";
+    }
+    return "ProxyCommand=nc -x $proxy_host:$proxy_port %h %p";
+}
+
 sub ssh_connect {
     my ($ip, $port, $user, $pass) = @_;
     my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', '-p', $port, "$user\@$ip");
 
     if ($proxy) {
-        push @cmd, '-o', "ProxyCommand=nc -x $proxy_host:$proxy_port %h %p";
+        push @cmd, '-o', build_proxy_command($proxy_host, $proxy_port);
     }
 
-    if ($pass && system("which sshpass >/dev/null 2>&1") == 0) {
+    if ($pass) {
+        unless (`which sshpass 2>/dev/null`) {
+            die "错误: 未找到 'sshpass' 命令。请安装 sshpass 或使用 SSH 密钥。\n";
+        }
         unshift @cmd, 'sshpass', '-p', $pass;
     }
 
@@ -176,7 +323,7 @@ sub scp_transfer {
     push @opts, '-r' if $recursive;
 
     if ($proxy) {
-        push @opts, '-o', "ProxyCommand=nc -x $proxy_host:$proxy_port %h %p";
+        push @opts, '-o', build_proxy_command($proxy_host, $proxy_port);
     }
 
     my ($src, $dst);
@@ -189,19 +336,34 @@ sub scp_transfer {
         $dst = $p2;
         $dst =~ s{^~}{$ENV{HOME}};
         $dst = getcwd() if $dst eq '.' || $dst eq './';
-        make_path(dirname($dst));
+        my $dst_dir = dirname($dst);
+        make_path($dst_dir) if $dst_dir && $dst_dir ne '.';
     }
 
-    if ($pass && `which sshpass 2>/dev/null`) {
+    if ($pass) {
+        unless (`which sshpass 2>/dev/null`) {
+            die "错误: 未找到 'sshpass' 命令。请安装 sshpass 或使用 SSH 密钥。\n";
+        }
         unshift @opts, 'sshpass', '-p', $pass;
     }
 
     say "执行: @opts $src $dst" unless $quiet;
-    system(@opts, $src, $dst) == 0 or exit 1;
+    my $exit_code = system(@opts, $src, $dst);
+    if ($exit_code != 0) {
+        my $exit_value = $exit_code >> 8;
+        die "传输失败，退出码: $exit_value\n";
+    }
 }
 
 sub list_hosts {
-    say "已保存的别名：";
+    my $count = grep { $_ ne 'global' } keys %$config;
+    if ($count == 0) {
+        say "暂无已保存的别名";
+        return;
+    }
+    say "已保存的别名（共 $count 个）：";
+    printf "  %-12s  %-15s  %-6s  %s\n", "别名", "IP/域名", "端口", "用户";
+    say "  " . "-" x 50;
     for my $name (sort grep { $_ ne 'global' } keys %$config) {
         my $h = $config->{$name};
         printf "  %-12s  %-15s  %-6s  %s\n",
@@ -209,6 +371,83 @@ sub list_hosts {
             $h->{ip} // '-',
             $h->{port} // '22',
             $h->{user} // '-';
+    }
+}
+
+sub delete_alias {
+    my $alias = shift;
+    unless (exists $config->{$alias}) {
+        die "错误: 别名 [$alias] 不存在\n";
+    }
+    print "确认删除别名 [$alias]？(y/N): ";
+    chomp(my $confirm = <STDIN>);
+    unless (lc($confirm) eq 'y') {
+        say "已取消";
+        return;
+    }
+    delete $config->{$alias};
+    # 同时删除 Keychain 中的密码
+    keychain_delete_password($alias);
+    my $default_user = $config->{global}{user} // 'root';
+    my $default_port = $config->{global}{port} // 22;
+    save_config($default_user, $default_port);
+    say "已删除别名 [$alias]（包括 Keychain 中的密码）";
+}
+
+sub test_connection {
+    my ($ip, $port, $user, $pass) = @_;
+    
+    say "测试 SSH 连接到 $user\@$ip:$port..." unless $quiet;
+    
+    my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', 
+               '-o', 'ConnectTimeout=5',
+               '-p', $port, 
+               "$user\@$ip",
+               'echo "连接成功！"');
+    
+    if ($proxy) {
+        push @cmd, '-o', build_proxy_command($proxy_host, $proxy_port);
+    }
+    
+    if ($pass) {
+        unless (`which sshpass 2>/dev/null`) {
+            die "错误: 未找到 'sshpass' 命令。请安装 sshpass 或使用 SSH 密钥。\n";
+        }
+        # 使用密码时，启用密码认证
+        push @cmd, '-o', 'PasswordAuthentication=yes';
+        push @cmd, '-o', 'PreferredAuthentications=password,publickey';
+        unshift @cmd, 'sshpass', '-p', $pass;
+    } else {
+        # 没有密码时，使用 BatchMode 快速失败（仅使用密钥）
+        push @cmd, '-o', 'BatchMode=yes';
+    }
+    
+    # 执行测试并捕获输出
+    open my $pipe, '-|', @cmd, '2>&1' or die "无法执行测试命令\n";
+    my $output = '';
+    while (<$pipe>) {
+        $output .= $_;
+        print $_ unless $quiet;  # 显示实时输出
+    }
+    close $pipe;
+    my $exit_code = $?;
+    
+    if ($exit_code == 0) {
+        say "✓ 连接测试成功！" unless $quiet;
+    } else {
+        my $exit_value = $exit_code >> 8;
+        chomp $output;
+        if ($output =~ /Permission denied/) {
+            if ($pass) {
+                die "✗ 连接测试失败：认证失败（密码可能不正确或需要使用 SSH 密钥）\n";
+            } else {
+                die "✗ 连接测试失败：认证失败（需要密码或 SSH 密钥，请检查 Keychain 中是否有密码）\n";
+            }
+        } elsif ($output =~ /Connection refused|Connection timed out|Network is unreachable/) {
+            die "✗ 连接测试失败：无法连接到服务器（$output）\n";
+        } else {
+            die "✗ 连接测试失败，退出码: $exit_value" . ($output ? " ($output)" : "") . "\n";
+        }
     }
 }
 
@@ -242,8 +481,10 @@ goto - 单文件同步 + 可选代理（终极版）
 
 其他命令：
   goto ping <别名|IP>             → Ping 测试连通性（不支持代理）
+  goto --test <别名|IP>           → 测试 SSH 连接（支持代理）
   goto --list                     → 列出所有已保存的别名
   goto --edit                     → 用编辑器打开配置文件（iCloud 自动同步）
+  goto --delete <别名>            → 删除已保存的别名
 
 可选参数（可乱序）：
   -x 或 --proxy      → 启用 SOCKS5 代理（nc -x 127.0.0.1:7890）
@@ -253,7 +494,12 @@ goto - 单文件同步 + 可选代理（终极版）
 配置文件（唯一文件，多台 Mac 共享）：
   ~/Documents/config/goto/goto.ini
 
-完美支持 iCloud 同步，别名、密码、默认设置全部跨设备实时可用！
+安全特性：
+  - 密码存储在 macOS Keychain 中（更安全，支持 Touch ID/Face ID）
+  - 配置文件不再包含密码，可安全同步到 iCloud
+  - 首次运行会自动迁移现有密码到 Keychain
+
+完美支持 iCloud 同步，别名、默认设置全部跨设备实时可用！
 EOF
     exit 0;
 }

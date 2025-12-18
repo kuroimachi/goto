@@ -75,7 +75,6 @@ if ($mode eq 'delete') {
 
 my ($ip, $port, $user, $pass, $alias) = resolve_target($target, $default_user, $default_port);
 
-say "→ $user\@$ip:$port (模式: $mode" . ($proxy ? ", 走代理" : "") . ")" unless $quiet;
 
 if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass, $alias); }
 elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }
@@ -131,13 +130,6 @@ sub keychain_set_password {
         my $test = `security find-generic-password -a "$account" -s "$service" -w 2>/dev/null`;
         chomp $test;
         if ($test eq $password) {
-            # 提示用户关于 iCloud 同步
-            unless ($quiet) {
-                say "提示: 密码已保存到 macOS Keychain";
-                say "     如需在其他 Mac 上使用，请确保：";
-                say "     1. 已启用 iCloud Keychain（系统设置 > Apple ID > iCloud > Keychain）";
-                say "     2. 其他 Mac 使用相同的 Apple ID 登录";
-            }
             return 1;
         }
     }
@@ -183,7 +175,6 @@ sub migrate_passwords_to_keychain {
         my $default_user = $config->{global}{user} // 'root';
         my $default_port = $config->{global}{port} // 22;
         save_config($default_user, $default_port);
-        say "已迁移 $migrated 个密码到 macOS Keychain（更安全）" unless $quiet;
     }
 }
 
@@ -199,14 +190,10 @@ sub resolve_target {
         $user = $h->{user}     // $user;
         # 从 Keychain 读取密码
         $pass = keychain_get_password($input) // '';
-        say "使用别名 [$input]" unless $quiet;
     }
     elsif (!is_ip($input)) {
         if (my $packed = gethostbyname($input)) {
             $ip = inet_ntoa($packed);
-            say "DNS 解析 $input → $ip" unless $quiet;
-        } else {
-            warn "警告: 无法解析域名 $input\n" unless $quiet;
         }
     }
 
@@ -263,18 +250,13 @@ sub add_alias {
     
     # 将密码存储到 Keychain（如果提供了密码）
     if ($pass ne '') {
-        if (keychain_set_password($alias, $pass)) {
-            say "密码已安全存储到 macOS Keychain" unless $quiet;
-        } else {
-            warn "警告: 无法将密码存储到 Keychain，请检查系统权限\n";
-        }
+        keychain_set_password($alias, $pass);
     } else {
         # 如果没有密码，确保 Keychain 中也没有旧密码
         keychain_delete_password($alias);
     }
     
     save_config($default_user, $default_port);
-    say "已保存别名 [$alias]（iCloud 同步后其他机器立即可用）";
 }
 
 sub load_config {
@@ -332,7 +314,7 @@ sub build_proxy_command {
 
 # 测试密码是否正确（不保存）
 sub test_password {
-    my ($ip, $port, $user, $pass) = @_;
+    my ($ip, $port, $user, $pass, $use_proxy, $proxy_host, $proxy_port) = @_;
     
     my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', 
                '-o', 'ConnectTimeout=5',
@@ -342,8 +324,10 @@ sub test_password {
                "$user\@$ip",
                'echo "test"');
     
-    if ($proxy) {
-        push @cmd, '-o', build_proxy_command($proxy_host, $proxy_port);
+    # 如果使用代理，添加代理命令（与 ssh_connect 保持一致）
+    if ($use_proxy) {
+        my $proxy_cmd = build_proxy_command($proxy_host, $proxy_port);
+        push @cmd, '-o', $proxy_cmd;
     }
     
     unless (`which sshpass 2>/dev/null`) {
@@ -352,7 +336,7 @@ sub test_password {
     
     unshift @cmd, 'sshpass', '-p', $pass;
     
-    # 执行测试，不显示输出
+    # 执行测试，捕获输出和错误
     open my $pipe, '-|', @cmd, '2>&1' or return 0;
     my $output = '';
     while (<$pipe>) {
@@ -361,7 +345,21 @@ sub test_password {
     close $pipe;
     my $result = $?;
     
-    return $result == 0;
+    # 检查是否是连接错误（可能是代理问题）还是认证错误
+    if ($result != 0) {
+        chomp $output;
+        # 如果是连接错误（Connection refused, Connection timed out 等），不是密码错误
+        if ($output =~ /Connection (refused|timed out|reset)/) {
+            # 返回 -1 表示连接失败（不是密码错误）
+            return -1;
+        }
+        # 如果是认证错误（Permission denied），返回 0 表示密码错误
+        if ($output =~ /Permission denied/) {
+            return 0;
+        }
+    }
+    
+    return $result == 0 ? 1 : 0;
 }
 
 sub ssh_connect {
@@ -380,31 +378,32 @@ sub ssh_connect {
             print "\n";
             
             if ($pass eq '') {
-                say "密码不能为空，请重试" unless $quiet;
                 $attempt++;
                 next;
             }
             
-            # 先测试密码是否正确
-            say "正在验证密码..." unless $quiet;
-            if (test_password($ip, $port, $user, $pass)) {
+            # 先测试密码是否正确（传递代理参数，与 ssh_connect 保持一致）
+            my $test_result = test_password($ip, $port, $user, $pass, $proxy, $proxy_host, $proxy_port);
+            
+            if ($test_result == 1) {
                 # 密码正确，保存到 Keychain
-                if (keychain_set_password($alias, $pass)) {
-                    say "✓ 密码验证成功，已保存到 Keychain" unless $quiet;
-                    last;  # 跳出循环
+                keychain_set_password($alias, $pass);
+                last;  # 跳出循环
+            } elsif ($test_result == -1) {
+                # 连接失败（可能是代理问题）
+                $attempt++;
+                if ($attempt < $max_attempts) {
+                    $pass = '';  # 清空密码，重新输入
                 } else {
-                    warn "警告: 无法保存密码到 Keychain\n";
-                    # 即使保存失败，也继续使用这个密码连接
-                    last;
+                    die "连接失败次数过多\n";
                 }
             } else {
                 # 密码错误
                 $attempt++;
                 if ($attempt < $max_attempts) {
-                    say "✗ 密码错误，请重试（剩余 $max_attempts - $attempt 次机会）" unless $quiet;
                     $pass = '';  # 清空密码，重新输入
                 } else {
-                    die "✗ 密码错误次数过多，已取消。如需更新密码，请先删除 Keychain 中的旧密码。\n";
+                    die "密码错误次数过多\n";
                 }
             }
         }
@@ -463,7 +462,6 @@ sub scp_transfer {
         unshift @opts, 'sshpass', '-p', $pass;
     }
 
-    say "执行: @opts $src $dst" unless $quiet;
     my $exit_code = system(@opts, $src, $dst);
     if ($exit_code != 0) {
         my $exit_value = $exit_code >> 8;
@@ -474,12 +472,9 @@ sub scp_transfer {
 sub list_hosts {
     my $count = grep { $_ ne 'global' } keys %$config;
     if ($count == 0) {
-        say "暂无已保存的别名";
         return;
     }
-    say "已保存的别名（共 $count 个）：";
     printf "  %-12s  %-15s  %-6s  %s\n", "别名", "IP/域名", "端口", "用户";
-    say "  " . "-" x 50;
     for my $name (sort grep { $_ ne 'global' } keys %$config) {
         my $h = $config->{$name};
         printf "  %-12s  %-15s  %-6s  %s\n",
@@ -498,22 +493,17 @@ sub delete_alias {
     print "确认删除别名 [$alias]？(y/N): ";
     chomp(my $confirm = <STDIN>);
     unless (lc($confirm) eq 'y') {
-        say "已取消";
         return;
     }
     delete $config->{$alias};
-    # 同时删除 Keychain 中的密码
     keychain_delete_password($alias);
     my $default_user = $config->{global}{user} // 'root';
     my $default_port = $config->{global}{port} // 22;
     save_config($default_user, $default_port);
-    say "已删除别名 [$alias]（包括 Keychain 中的密码）";
 }
 
 sub test_connection {
     my ($ip, $port, $user, $pass) = @_;
-    
-    say "测试 SSH 连接到 $user\@$ip:$port..." unless $quiet;
     
     my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', 
                '-o', 'ConnectTimeout=5',
@@ -549,7 +539,7 @@ sub test_connection {
     my $exit_code = $?;
     
     if ($exit_code == 0) {
-        say "✓ 连接测试成功！" unless $quiet;
+        exit 0;
     } else {
         my $exit_value = $exit_code >> 8;
         chomp $output;
@@ -573,49 +563,28 @@ sub is_ip {
     return eval { inet_aton($i); 1 };
 }
 
-# ============== 最新最详细的帮助信息 ==============
 sub print_help {
     print <<'EOF';
-goto - 单文件同步 + 可选代理（终极版）
+goto - SSH 连接和文件传输工具
 
-基本用法：
-  goto <别名|IP>                  → 直接 SSH 登录服务器
-  goto -x <别名|IP>               → 通过 SOCKS5 代理登录（127.0.0.1:7890）
+用法：
+  goto <别名|IP>                  SSH 登录
+  goto -x <别名|IP>               通过代理登录
+  goto up   [-x] [-r] <别名|IP> <本地> <远程>    上传文件
+  goto down [-x] [-r] <别名|IP> <远程> <本地>    下载文件
+  goto ping <别名|IP>             Ping 测试
+  goto --test <别名|IP>           测试连接
+  goto --list                     列出别名
+  goto --edit                     编辑配置
+  goto --delete <别名>            删除别名
 
-文件传输（支持组合使用 -x -r）：
-  goto up   [-x] [-r] <别名|IP> <本地路径> <远程路径>
-      → 上传：本地 → 服务器
-      示例：
-        goto up prod ./error.log /var/log/
-        goto up -x -r hkserver /project/build/ /www/
+参数：
+  -x, --proxy      启用 SOCKS5 代理
+  -r, --recursive  递归传输目录
+  -q, --quiet      安静模式
 
-  goto down [-x] [-r] <别名|IP> <远程路径> <本地路径>
-      → 下载：服务器 → 本地
-      示例：
-        goto down prod /etc/nginx/nginx.conf ~/Downloads/
-        goto down -x -r overseas /data/backup.tar.gz ./
-
-其他命令：
-  goto ping <别名|IP>             → Ping 测试连通性（不支持代理）
-  goto --test <别名|IP>           → 测试 SSH 连接（支持代理）
-  goto --list                     → 列出所有已保存的别名
-  goto --edit                     → 用编辑器打开配置文件（iCloud 自动同步）
-  goto --delete <别名>            → 删除已保存的别名
-
-可选参数（可乱序）：
-  -x 或 --proxy      → 启用 SOCKS5 代理（nc -x 127.0.0.1:7890）
-  -r 或 --recursive  → 递归传输目录
-  -q 或 --quiet      → 安静模式（减少提示）
-
-配置文件（唯一文件，多台 Mac 共享）：
-  ~/Documents/config/goto/goto.ini
-
-安全特性：
-  - 密码存储在 macOS Keychain 中（更安全，支持 Touch ID/Face ID）
-  - 配置文件不再包含密码，可安全同步到 iCloud
-  - 首次运行会自动迁移现有密码到 Keychain
-
-完美支持 iCloud 同步，别名、默认设置全部跨设备实时可用！
+配置：~/Documents/config/goto/goto.ini
+密码存储在 macOS Keychain，支持 iCloud 同步
 EOF
     exit 0;
 }

@@ -73,11 +73,11 @@ if ($mode eq 'delete') {
     exit 0;
 }
 
-my ($ip, $port, $user, $pass) = resolve_target($target, $default_user, $default_port);
+my ($ip, $port, $user, $pass, $alias) = resolve_target($target, $default_user, $default_port);
 
 say "→ $user\@$ip:$port (模式: $mode" . ($proxy ? ", 走代理" : "") . ")" unless $quiet;
 
-if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass); }
+if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass, $alias); }
 elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }
 elsif ($mode eq 'test') { test_connection($ip, $port, $user, $pass); }
 elsif ($mode eq 'up')   { scp_transfer('up',   $ip, $port, $user, $pass, @ARGV); }
@@ -106,10 +106,42 @@ sub keychain_set_password {
     # 先删除旧密码（如果存在）
     system("security delete-generic-password -a \"$account\" -s \"$service\" >/dev/null 2>&1");
     
-    # 添加新密码
-    open my $pipe, '|-', "security add-generic-password -a \"$account\" -s \"$service\" -w \"$password\" -U" or return 0;
-    close $pipe;
-    return $? == 0;
+    # 添加到登录 keychain（会同步到 iCloud Keychain，如果已启用）
+    # 使用 -T 参数指定可访问的程序，确保可以同步
+    # 使用 -U 参数更新（如果已存在）
+    # 明确指定 login.keychain-db 以确保同步到 iCloud
+    my $keychain_path = "$ENV{HOME}/Library/Keychains/login.keychain-db";
+    my $cmd = "security add-generic-password -a \"$account\" -s \"$service\" -w \"$password\" -T /usr/bin/security -T /usr/bin/ssh -T /usr/bin/scp -U";
+    
+    # 明确指定登录 keychain（确保同步到 iCloud）
+    if (-e $keychain_path) {
+        $cmd .= " \"$keychain_path\"";
+    } else {
+        # 如果 login.keychain-db 不存在，尝试 login.keychain（旧版本）
+        my $old_keychain = "$ENV{HOME}/Library/Keychains/login.keychain";
+        if (-e $old_keychain) {
+            $cmd .= " \"$old_keychain\"";
+        }
+    }
+    
+    my $result = system("$cmd >/dev/null 2>&1");
+    
+    if ($result == 0) {
+        # 验证是否成功添加
+        my $test = `security find-generic-password -a "$account" -s "$service" -w 2>/dev/null`;
+        chomp $test;
+        if ($test eq $password) {
+            # 提示用户关于 iCloud 同步
+            unless ($quiet) {
+                say "提示: 密码已保存到 macOS Keychain";
+                say "     如需在其他 Mac 上使用，请确保：";
+                say "     1. 已启用 iCloud Keychain（系统设置 > Apple ID > iCloud > Keychain）";
+                say "     2. 其他 Mac 使用相同的 Apple ID 登录";
+            }
+            return 1;
+        }
+    }
+    return 0;
 }
 
 sub keychain_delete_password {
@@ -157,9 +189,10 @@ sub migrate_passwords_to_keychain {
 
 sub resolve_target {
     my ($input, $default_user, $default_port) = @_;
-    my ($ip, $port, $user, $pass) = ($input, $default_port, $default_user, '');
+    my ($ip, $port, $user, $pass, $alias) = ($input, $default_port, $default_user, '', '');
 
     if (exists $config->{$input}) {
+        $alias = $input;  # 保存别名，用于后续保存密码
         my $h = $config->{$input};
         $ip   = $h->{ip}       // $ip;
         $port = $h->{port}     // $port;
@@ -185,7 +218,7 @@ sub resolve_target {
     # 验证解析结果
     die "错误: 无法解析目标 $input（不是有效的 IP、域名或别名）\n" unless is_ip($ip) || exists $config->{$input};
     
-    return ($ip, $port, $user, $pass);
+    return ($ip, $port, $user, $pass, $alias);
 }
 
 sub add_alias {
@@ -298,7 +331,26 @@ sub build_proxy_command {
 }
 
 sub ssh_connect {
-    my ($ip, $port, $user, $pass) = @_;
+    my ($ip, $port, $user, $pass, $alias) = @_;
+    
+    # 如果没有密码，提示用户输入并保存到 Keychain
+    if (!$pass && $alias) {
+        print "Keychain 中未找到密码，请输入密码（将保存到 Keychain）: ";
+        ReadMode('noecho');
+        chomp($pass = <STDIN>);
+        ReadMode('restore');
+        print "\n";
+        
+        if ($pass ne '') {
+            # 保存到 Keychain
+            if (keychain_set_password($alias, $pass)) {
+                say "密码已保存到 Keychain" unless $quiet;
+            } else {
+                warn "警告: 无法保存密码到 Keychain\n";
+            }
+        }
+    }
+    
     my @cmd = ('ssh', 
                '-o', 'StrictHostKeyChecking=no', 
                '-o', 'ServerAliveInterval=60',      # 每 60 秒发送一次 keepalive

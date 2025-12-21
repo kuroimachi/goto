@@ -180,31 +180,28 @@ sub migrate_passwords_to_keychain {
 
 sub resolve_target {
     my ($input, $default_user, $default_port) = @_;
-    my ($ip, $port, $user, $pass, $alias) = ($input, $default_port, $default_user, '', '');
+    my ($ip, $port, $user, $pass, $alias) = ('', $default_port, $default_user, '', '');
 
+    # 如果配置里已经有这个别名，直接使用配置
     if (exists $config->{$input}) {
-        $alias = $input;  # 保存别名，用于后续保存密码
+        $alias = $input;
         my $h = $config->{$input};
-        $ip   = $h->{ip}       // $ip;
-        $port = $h->{port}     // $port;
-        $user = $h->{user}     // $user;
-        # 从 Keychain 读取密码
+        $ip = $h->{ip} // die "别名 $input 配置中缺少 ip\n";
+        $port = $h->{port} // $port;
+        $user = $h->{user} // $user;
         $pass = keychain_get_password($input) // '';
     }
-    elsif (!is_ip($input)) {
-        if (my $packed = gethostbyname($input)) {
-            $ip = inet_ntoa($packed);
-        }
-    }
-
-    if (!is_ip($ip) && !exists $config->{$input}) {
+    else {
+        # 新别名：直接触发添加流程，不尝试 DNS 解析
+        # 因为你明确说“不会输入域名”，所以这里完全跳过 gethostbyname
+        say "检测到新别名 [$input]，开始配置...";
         add_alias($input, $default_user, $default_port);
+        # 递归调用，读取刚添加的配置
         return resolve_target($input, $default_user, $default_port);
     }
-    
-    # 验证解析结果
-    die "错误: 无法解析目标 $input（不是有效的 IP、域名或别名）\n" unless is_ip($ip) || exists $config->{$input};
-    
+
+    die "错误: 无法获取有效 IP（别名 $input 配置异常）\n" unless $ip && is_ip($ip);
+
     return ($ip, $port, $user, $pass, $alias);
 }
 

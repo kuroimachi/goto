@@ -192,8 +192,7 @@ sub resolve_target {
         $pass = keychain_get_password($input) // '';
     }
     else {
-        # 新别名：直接触发添加流程，不尝试 DNS 解析
-        # 因为你明确说“不会输入域名”，所以这里完全跳过 gethostbyname
+        # 新别名：直接触发添加流程
         say "检测到新别名 [$input]，开始配置...";
         add_alias($input, $default_user, $default_port);
         # 递归调用，读取刚添加的配置
@@ -216,8 +215,8 @@ sub add_alias {
     }
     
     say "添加新别名 [$alias]";
-    print "IP 或域名: "; chomp(my $ip = <STDIN>);
-    die "无效 IP 或域名\n" unless is_ip($ip) || gethostbyname($ip);
+    print "IP: "; chomp(my $ip = <STDIN>);
+    die "无效 IP\n" unless is_ip($ip);
 
     print "端口 [$default_port]: "; chomp(my $p = <STDIN>); $p = $default_port if $p eq '';
     print "用户 [$default_user]: "; chomp(my $u = <STDIN>); $u = $default_user if $u eq '';
@@ -471,7 +470,7 @@ sub list_hosts {
     if ($count == 0) {
         return;
     }
-    printf "  %-12s  %-15s  %-6s  %s\n", "别名", "IP/域名", "端口", "用户";
+    printf "  %-12s  %-15s  %-6s  %s\n", "别名", "IP", "端口", "用户";
     for my $name (sort grep { $_ ne 'global' } keys %$config) {
         my $h = $config->{$name};
         printf "  %-12s  %-15s  %-6s  %s\n",

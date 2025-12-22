@@ -180,63 +180,37 @@ sub migrate_passwords_to_keychain {
 
 sub resolve_target {
     my ($input, $default_user, $default_port) = @_;
-    my ($ip, $port, $user, $pass, $alias) = ('', $default_port, $default_user, '', '');
 
     # 如果配置里已经有这个别名，直接使用配置
     if (exists $config->{$input}) {
-        $alias = $input;
         my $h = $config->{$input};
-        $ip = $h->{ip} // die "别名 $input 配置中缺少 ip\n";
-        $port = $h->{port} // $port;
-        $user = $h->{user} // $user;
-        $pass = keychain_get_password($input) // '';
+        my $ip = $h->{ip} // die "别名 $input 配置中缺少 ip\n";
+        my $port = $h->{port} // $default_port;
+        my $user = $h->{user} // $default_user;
+        my $pass = keychain_get_password($input) // '';
+        return ($ip, $port, $user, $pass, $input);
     }
-    else {
-        # 新别名：直接触发添加流程
-        say "检测到新别名 [$input]，开始配置...";
-        add_alias($input, $default_user, $default_port);
-        # 递归调用，读取刚添加的配置
-        return resolve_target($input, $default_user, $default_port);
-    }
-
-    die "错误: 无法获取有效 IP（别名 $input 配置异常）\n" unless $ip && is_ip($ip);
-
-    return ($ip, $port, $user, $pass, $alias);
+    
+    # 新别名：触发添加流程
+    add_alias($input, $default_user, $default_port);
+    # 递归调用，读取刚添加的配置
+    return resolve_target($input, $default_user, $default_port);
 }
 
 sub add_alias {
     my ($alias, $default_user, $default_port) = @_;
     
-    # 检查别名是否已存在
-    if (exists $config->{$alias}) {
-        print "别名 [$alias] 已存在，是否覆盖？(y/N): ";
-        chomp(my $confirm = <STDIN>);
-        die "已取消\n" unless lc($confirm) eq 'y';
-    }
-    
-    say "添加新别名 [$alias]";
     print "IP: "; chomp(my $ip = <STDIN>);
     die "无效 IP\n" unless is_ip($ip);
 
     print "端口 [$default_port]: "; chomp(my $p = <STDIN>); $p = $default_port if $p eq '';
     print "用户 [$default_user]: "; chomp(my $u = <STDIN>); $u = $default_user if $u eq '';
 
-    my $pass = '';
     print "密码（留空用密钥）: ";
     ReadMode('noecho');
-    chomp($pass = <STDIN>);
+    chomp(my $pass = <STDIN>);
     ReadMode('restore');
     print "\n";
-    
-    # 如果输入了密码，要求二次确认
-    if ($pass ne '') {
-        print "再次输入密码确认: ";
-        ReadMode('noecho');
-        chomp(my $pass2 = <STDIN>);
-        ReadMode('restore');
-        print "\n";
-        die "密码不一致，已取消\n" unless $pass eq $pass2;
-    }
 
     $config->{$alias} = {
         ip   => $ip,
@@ -248,7 +222,6 @@ sub add_alias {
     if ($pass ne '') {
         keychain_set_password($alias, $pass);
     } else {
-        # 如果没有密码，确保 Keychain 中也没有旧密码
         keychain_delete_password($alias);
     }
     
@@ -367,40 +340,28 @@ sub ssh_connect {
         my $attempt = 0;
         
         while ($attempt < $max_attempts) {
-            print "Keychain 中未找到密码，请输入密码（将验证后保存到 Keychain）: ";
+            print "请输入密码: ";
             ReadMode('noecho');
             chomp($pass = <STDIN>);
             ReadMode('restore');
             print "\n";
             
-            if ($pass eq '') {
-                $attempt++;
-                next;
-            }
+            next if $pass eq '';
             
-            # 先测试密码是否正确（传递代理参数，与 ssh_connect 保持一致）
+            # 测试密码是否正确
             my $test_result = test_password($ip, $port, $user, $pass, $proxy, $proxy_host, $proxy_port);
             
             if ($test_result == 1) {
-                # 密码正确，保存到 Keychain
                 keychain_set_password($alias, $pass);
-                last;  # 跳出循环
+                last;
             } elsif ($test_result == -1) {
-                # 连接失败（可能是代理问题）
                 $attempt++;
-                if ($attempt < $max_attempts) {
-                    $pass = '';  # 清空密码，重新输入
-                } else {
-                    die "连接失败次数过多\n";
-                }
+                die "连接失败\n" if $attempt >= $max_attempts;
+                $pass = '';
             } else {
-                # 密码错误
                 $attempt++;
-                if ($attempt < $max_attempts) {
-                    $pass = '';  # 清空密码，重新输入
-                } else {
-                    die "密码错误次数过多\n";
-                }
+                die "密码错误\n" if $attempt >= $max_attempts;
+                $pass = '';
             }
         }
     }

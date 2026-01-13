@@ -67,7 +67,7 @@ if (exists $config->{global}{proxy_port}) {
 if ($mode eq 'list') { list_hosts(); exit 0; }
 if ($mode eq 'edit') { exec($ENV{EDITOR} // 'nano', $INI_FILE); exit 0; }
 if ($mode eq 'delete') {
-    my $alias = shift @ARGV;
+    my $alias = $target || shift @ARGV;
     die "请指定要删除的别名\n" unless $alias;
     delete_alias($alias);
     exit 0;

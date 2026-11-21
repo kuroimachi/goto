@@ -8,6 +8,7 @@ use Cwd qw(getcwd);
 use File::Basename;
 use File::Path qw(make_path);
 use Getopt::Long;
+use Encode qw(decode);
 
 ##############################################################
 ## goto - 单文件同步终极版 + 支持可选代理（专为 luqiucheng）
@@ -34,56 +35,124 @@ my $proxy     = 0;
 my $proxy_host = '127.0.0.1';
 my $proxy_port = 7890;  # Clash/V2Ray 等默认 SOCKS5 端口，可自行修改
 
+Getopt::Long::Configure('no_auto_abbrev', 'no_ignore_case');
 GetOptions(
-    "up"          => sub { $mode = 'up' },
-    "down"        => sub { $mode = 'down' },
-    "ping"        => sub { $mode = 'ping' },
-    "test"        => sub { $mode = 'test' },
-    "list"        => sub { $mode = 'list' },
-    "edit"        => sub { $mode = 'edit' },
-    "delete"      => sub { $mode = 'delete' },
     "r|recursive" => \$recursive,
     "q|quiet"     => \$quiet,
     "x|proxy"     => \$proxy,
     "h|help"      => sub { print_help(); exit 0 },
 ) or exit 1;
 
-my $target = shift @ARGV // '';
-if (!$target && $mode !~ /^(list|edit|delete)$/) {
-    print_help();
+my %commands = map { $_ => 1 } qw(ssh up down ping test list edit delete help);
+my $first = shift @ARGV;
+if (!defined $first) {
+    $mode = main_menu();
+} elsif ($commands{$first}) {
+    $mode = $first;
+} else {
+    unshift @ARGV, $first;
 }
+print_help() if $mode eq 'help';
 
 my $default_user = $config->{global}{user} // 'root';
 my $default_port = $config->{global}{port} // 22;
-
-# 从配置文件读取代理设置（如果存在）
-if (exists $config->{global}{proxy_host}) {
-    $proxy_host = $config->{global}{proxy_host};
-}
-if (exists $config->{global}{proxy_port}) {
-    $proxy_port = $config->{global}{proxy_port};
-}
+$proxy_host = $config->{global}{proxy_host} if exists $config->{global}{proxy_host};
+$proxy_port = $config->{global}{proxy_port} if exists $config->{global}{proxy_port};
 
 if ($mode eq 'list') { list_hosts(); exit 0; }
-if ($mode eq 'edit') { exec($ENV{EDITOR} // 'nano', $INI_FILE); exit 0; }
-if ($mode eq 'delete') {
-    my $alias = $target || shift @ARGV;
-    die "请指定要删除的别名\n" unless $alias;
-    delete_alias($alias);
-    exit 0;
+if ($mode eq 'edit') { exec($ENV{EDITOR} // 'nano', $INI_FILE); die "无法启动编辑器: $!\n"; }
+
+my $target = shift @ARGV;
+$target = select_host() unless defined $target && length $target;
+if ($mode eq 'delete') { delete_alias($target); exit 0; }
+
+if ($mode eq 'up' || $mode eq 'down') {
+    my @labels = $mode eq 'up' ? ('本地路径', '远程路径') : ('远程路径', '本地路径');
+    while (@ARGV < 2) {
+        push @ARGV, prompt_value($labels[scalar @ARGV]);
+    }
 }
 
 my ($ip, $port, $user, $pass, $alias) = resolve_target($target, $default_user, $default_port);
-
-
 if    ($mode eq 'ssh')  { ssh_connect($ip, $port, $user, $pass, $alias); }
-elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); }
+elsif ($mode eq 'ping') { exec("ping", "-c", "4", $ip); die "无法启动 ping: $!\n"; }
 elsif ($mode eq 'test') { test_connection($ip, $port, $user, $pass); }
-elsif ($mode eq 'up')   { scp_transfer('up',   $ip, $port, $user, $pass, @ARGV); }
+elsif ($mode eq 'up')   { scp_transfer('up', $ip, $port, $user, $pass, @ARGV); }
 elsif ($mode eq 'down') { scp_transfer('down', $ip, $port, $user, $pass, @ARGV); }
-else { die "未知模式: $mode\n"; }
 
 # ==================== 子函数 ====================
+
+# 菜单只在交互终端中读取按键，避免脚本调用时等待输入。
+sub choose_menu {
+    my ($title, @items) = @_;
+    die "需要交互终端，请提供完整命令参数\n" unless -t STDIN && -t STDOUT;
+    my $selected = 0;
+    local $| = 1;
+    local $SIG{INT} = sub { ReadMode('restore'); print "\n"; exit 130; };
+    print "\n$title\n";
+    while (1) {
+        for my $i (0 .. $#items) {
+            print($i == $selected ? "  > " : "    ", $items[$i][0], "\n");
+        }
+        ReadMode('cbreak');
+        my $key = ReadKey(0);
+        if (defined $key && $key eq "\e") {
+            my $next = ReadKey(0.05);
+            my $direction = defined $next && $next eq '[' ? ReadKey(0.05) : undef;
+            $selected = ($selected - 1 + @items) % @items if defined $direction && $direction eq 'A';
+            $selected = ($selected + 1) % @items if defined $direction && $direction eq 'B';
+        }
+        ReadMode('restore');
+        if (!defined $key || $key eq "\n" || $key eq "\r") {
+            return $items[$selected][1] if defined $key;
+            exit 0;
+        }
+        exit 0 if $key eq 'q' || $key eq "\x03";
+        print "\e[" . scalar(@items) . "A\e[J";
+    }
+}
+
+sub main_menu {
+    my $mode = choose_menu('请选择操作（方向键选择，回车确认，q 退出）：',
+        ['连接主机', 'ssh'], ['上传文件', 'up'], ['下载文件', 'down'],
+        ['测试连接', 'test'], ['Ping 主机', 'ping'], ['管理主机', 'manage'], ['退出', 'quit']);
+    exit 0 if $mode eq 'quit';
+    if ($mode eq 'manage') {
+        $mode = choose_menu('请选择管理操作：', ['查看主机', 'list'], ['新增主机', 'add'],
+            ['编辑配置', 'edit'], ['删除主机', 'delete'], ['退出', 'quit']);
+        exit 0 if $mode eq 'quit';
+        if ($mode eq 'add') {
+            my $alias = prompt_value('新主机别名');
+            die "别名已存在\n" if exists $config->{$alias};
+            add_alias($alias, $config->{global}{user} // 'root', $config->{global}{port} // 22);
+            exit 0;
+        }
+    }
+    return $mode;
+}
+
+sub prompt_value {
+    my ($label) = @_;
+    die "缺少$label，请在交互终端输入或提供完整参数\n" unless -t STDIN;
+    print "$label: ";
+    my $value = <STDIN>;
+    exit 0 unless defined $value;
+    chomp $value;
+    die "$label不能为空\n" unless length $value;
+    return $value;
+}
+
+sub select_host {
+    my @hosts = sort grep { $_ ne 'global' } keys %$config;
+    if (!@hosts) {
+        die "没有已保存的主机，请先通过 goto 菜单新增主机\n";
+    }
+    my @items = map { [$_, $_] } @hosts;
+    push @items, ['退出', undef];
+    my $host = choose_menu('请选择主机：', @items);
+    exit 0 unless defined $host;
+    return $host;
+}
 
 # macOS Keychain 密码管理函数
 sub keychain_get_password {
@@ -282,6 +351,18 @@ sub build_proxy_command {
 }
 
 # 测试密码是否正确（不保存）
+sub command_output_pipe {
+    my @cmd = @_;
+    my $pid = open my $pipe, '-|';
+    return unless defined $pid;
+    if (!$pid) {
+        open STDERR, '>&', STDOUT or exit 1;
+        exec @cmd;
+        exit 1;
+    }
+    return $pipe;
+}
+
 sub test_password {
     my ($ip, $port, $user, $pass, $use_proxy, $proxy_host, $proxy_port) = @_;
     
@@ -289,9 +370,7 @@ sub test_password {
                '-o', 'ConnectTimeout=5',
                '-o', 'PasswordAuthentication=yes',
                '-o', 'PreferredAuthentications=password,publickey',
-               '-p', $port, 
-               "$user\@$ip",
-               'echo "test"');
+               '-p', $port);
     
     # 如果使用代理，添加代理命令（与 ssh_connect 保持一致）
     if ($use_proxy) {
@@ -299,6 +378,8 @@ sub test_password {
         push @cmd, '-o', $proxy_cmd;
     }
     
+    push @cmd, "$user\@$ip", 'echo "test"';
+
     unless (`which sshpass 2>/dev/null`) {
         return 0;  # 如果没有 sshpass，无法测试
     }
@@ -306,7 +387,7 @@ sub test_password {
     unshift @cmd, 'sshpass', '-p', $pass;
     
     # 执行测试，捕获输出和错误
-    open my $pipe, '-|', @cmd, '2>&1' or return 0;
+    my $pipe = command_output_pipe(@cmd) or return 0;
     my $output = '';
     while (<$pipe>) {
         $output .= $_;
@@ -346,7 +427,7 @@ sub ssh_connect {
             ReadMode('restore');
             print "\n";
             
-            next if $pass eq '';
+            last if $pass eq '';  # 留空时直接使用 SSH 密钥认证
             
             # 测试密码是否正确
             my $test_result = test_password($ip, $port, $user, $pass, $proxy, $proxy_host, $proxy_port);
@@ -370,8 +451,7 @@ sub ssh_connect {
                '-o', 'StrictHostKeyChecking=no', 
                '-o', 'ServerAliveInterval=60',      # 每 60 秒发送一次 keepalive
                '-o', 'ServerAliveCountMax=3',      # 最多 3 次无响应后断开（共 180 秒）
-               '-p', $port, 
-               "$user\@$ip");
+               '-p', $port);
 
     if ($proxy) {
         push @cmd, '-o', build_proxy_command($proxy_host, $proxy_port);
@@ -384,6 +464,7 @@ sub ssh_connect {
         unshift @cmd, 'sshpass', '-p', $pass;
     }
 
+    push @cmd, "$user\@$ip";
     exec(@cmd);
 }
 
@@ -426,19 +507,40 @@ sub scp_transfer {
     }
 }
 
-sub list_hosts {
-    my $count = grep { $_ ne 'global' } keys %$config;
-    if ($count == 0) {
-        return;
+sub display_width {
+    my ($text) = @_;
+    my $decoded = utf8::is_utf8($text) ? $text : decode('UTF-8', $text);
+    my $width = 0;
+    for my $char (split //, $decoded) {
+        next if $char =~ /\p{M}/;
+        $width += $char =~ /[\p{East_Asian_Width=Wide}\p{East_Asian_Width=Fullwidth}]/ ? 2 : 1;
     }
-    printf "  %-12s  %-15s  %-6s  %s\n", "别名", "IP", "端口", "用户";
-    for my $name (sort grep { $_ ne 'global' } keys %$config) {
-        my $h = $config->{$name};
-        printf "  %-12s  %-15s  %-6s  %s\n",
-            $name,
-            $h->{ip} // '-',
-            $h->{port} // '22',
-            $h->{user} // '-';
+    return $width;
+}
+
+sub list_hosts {
+    my @names = sort grep { $_ ne 'global' } keys %$config;
+    return unless @names;
+
+    my @rows = (['别名', 'IP', '端口', '用户']);
+    for my $name (@names) {
+        my $host = $config->{$name};
+        push @rows, [$name, $host->{ip} // '-', $host->{port} // '22', $host->{user} // '-'];
+    }
+
+    my @widths = (0, 0, 0);
+    for my $row (@rows) {
+        for my $i (0 .. 2) {
+            my $width = display_width($row->[$i]);
+            $widths[$i] = $width if $width > $widths[$i];
+        }
+    }
+    for my $row (@rows) {
+        print '  ';
+        for my $i (0 .. 2) {
+            print $row->[$i], ' ' x ($widths[$i] - display_width($row->[$i]) + 2);
+        }
+        print $row->[3], "\n";
     }
 }
 
@@ -464,9 +566,7 @@ sub test_connection {
     
     my @cmd = ('ssh', '-o', 'StrictHostKeyChecking=no', 
                '-o', 'ConnectTimeout=5',
-               '-p', $port, 
-               "$user\@$ip",
-               'echo "连接成功！"');
+               '-p', $port);
     
     if ($proxy) {
         push @cmd, '-o', build_proxy_command($proxy_host, $proxy_port);
@@ -485,8 +585,10 @@ sub test_connection {
         push @cmd, '-o', 'BatchMode=yes';
     }
     
+    push @cmd, "$user\@$ip", 'echo "连接成功！"';
+
     # 执行测试并捕获输出
-    open my $pipe, '-|', @cmd, '2>&1' or die "无法执行测试命令\n";
+    my $pipe = command_output_pipe(@cmd) or die "无法执行测试命令\n";
     my $output = '';
     while (<$pipe>) {
         $output .= $_;
@@ -525,15 +627,17 @@ sub print_help {
 goto - SSH 连接和文件传输工具
 
 用法：
-  goto <别名|IP>                  SSH 登录
-  goto -x <别名|IP>               通过代理登录
-  goto up   [-x] [-r] <别名|IP> <本地> <远程>    上传文件
-  goto down [-x] [-r] <别名|IP> <远程> <本地>    下载文件
-  goto ping <别名|IP>             Ping 测试
-  goto --test <别名|IP>           测试连接
-  goto --list                     列出别名
-  goto --edit                     编辑配置
-  goto --delete <别名>            删除别名
+  goto                           打开交互菜单
+  goto <别名>                    SSH 登录
+  goto ssh <别名>                连接与子命令同名的主机
+  goto -x <别名>                 通过代理登录
+  goto up   [-x] [-r] <别名>    <本地> <远程>    上传文件
+  goto down [-x] [-r] <别名>    <远程> <本地>    下载文件
+  goto ping <别名>                Ping 测试
+  goto test <别名>               测试连接
+  goto list                       列出别名
+  goto edit                       编辑配置
+  goto delete <别名>              删除别名
 
 参数：
   -x, --proxy      启用 SOCKS5 代理
